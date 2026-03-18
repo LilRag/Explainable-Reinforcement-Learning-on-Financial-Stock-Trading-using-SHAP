@@ -1,6 +1,6 @@
-yfinance
-gym-anything
-tensorflow 
-shap 
-matplotlib 
-pandas
+yfinance==1.2.0
+gym-anytrading==2.0.0
+tensorflow==2.21.0
+shap==0.51.0
+matplotlib==3.10.8
+pandas==3.0.1
