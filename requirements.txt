@@ -1,0 +1,6 @@
+yfinance
+gym-anything
+tensorflow 
+shap 
+matplotlib 
+pandas
