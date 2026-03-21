@@ -54,8 +54,8 @@ def load_and_parse_raw_csv(filepath="stock_data.csv"):
 all_data = load_and_parse_raw_csv("stock_data.csv")
 
 # Split on date — no re-download needed
-train_data = {t: df[df.index < "2021-06-01"]  for t, df in all_data.items()}
-test_data  = {t: df[df.index >= "2021-06-01"] for t, df in all_data.items()}
+train_data = {t: df[df.index < "2020-01-01"]  for t, df in all_data.items()}
+test_data  = {t: df[df.index >= "2020-01-01"] for t, df in all_data.items()}
 
 # Drop tickers that ended up empty after split
 train_data = {t: df for t, df in train_data.items() if not df.empty}
@@ -68,4 +68,7 @@ print(f"Test:  {len(test_data)} tickers")
 print("\nRELIANCE.BO train:")
 print(train_data["RELIANCE.BO"].head())
 print("\nAAPL test:")
-print(test_data["AAPL"].head())
+if "AAPL" in test_data:
+    print(test_data["AAPL"].head())
+else:
+    print("AAPL not in test set")
