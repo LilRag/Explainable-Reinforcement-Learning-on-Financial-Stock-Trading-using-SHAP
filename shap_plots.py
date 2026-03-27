@@ -29,10 +29,10 @@ def load_module(name, path):
     return mod
 
 base = os.path.dirname(os.path.abspath(__file__))
-dc   = load_module("data_cleaning", os.path.join(base, "data_cleaning.py"))
+ds   = load_module("data_splitting", os.path.join(base, "data_splitting.py"))
 dqn  = load_module("dqn_trading",   os.path.join(base, "dqn_trading.py"))
 
-train_data, test_data = dc.train_data, dc.test_data
+train_data, test_data = ds.train_data, ds.test_data
 
 TICKERS   = ["RELIANCE.BO", "TCS.BO", "AAPL", "MSFT"]
 available = [t for t in TICKERS if t in train_data and t in test_data]

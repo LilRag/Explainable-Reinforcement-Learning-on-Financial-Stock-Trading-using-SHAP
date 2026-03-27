@@ -24,18 +24,18 @@ warnings.filterwarnings("ignore")
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 WINDOW_SIZE   = 30
 N_ACTIONS     = 2
-HIDDEN1       = 64
-HIDDEN2       = 32
-LR            = 0.001
+HIDDEN1       = 50
+HIDDEN2       = 50
+LR            = 0.005
 GAMMA         = 0.95
 EPSILON_START = 1.0
 EPSILON_MIN   = 0.01
 EPSILON_DECAY = 0.995
 BATCH_SIZE    = 32
 MEMORY_SIZE   = 2000
-EPISODES      = 50
+EPISODES      = 30
 SHAP_BG       = 50
-
+EPOCHS_PER_EPISODE = 100
 
 # ── Numpy MLP ─────────────────────────────────────────────────────────────────
 class MLP:
@@ -118,13 +118,15 @@ class DQNAgent:
 
 # ── gym-anytrading env ────────────────────────────────────────────────────────
 def make_env(df):
-    return StocksEnv(df=df, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(df)))
-
+    env = StocksEnv(df=df, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(df)))
+    obs, _ = env.reset()
+    print(f"  Observation shape: {obs.shape}  →  flat dim: {obs.flatten().shape[0]}")
+    return env, obs.flatten().shape[0] 
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 def train_agent(ticker, train_df):
-    env      = make_env(train_df)
-    agent    = DQNAgent(state_dim=WINDOW_SIZE * 2)   # obs shape (30,2) → 60
+    env, state_dim = make_env(train_df)
+    agent    = DQNAgent(state_dim=state_dim)
     ep_rews  = []
 
     for ep in range(1, EPISODES + 1):
@@ -149,7 +151,8 @@ def train_agent(ticker, train_df):
 
 # ── Test: collect actions + rewards ──────────────────────────────────────────
 def collect_test_experience(test_df, agent):
-    env   = make_env(test_df)
+    agent.epsilon = 0
+    env, _ = make_env(test_df)
     obs,_ = env.reset()
     state = obs.flatten()
     actions, rewards = [], []
@@ -160,6 +163,11 @@ def collect_test_experience(test_df, agent):
         actions.append(action)
         rewards.append(float(r))
         state = obs2.flatten()
+
+    agent.epsilon = EPSILON_START
+
+    print(f"  Steps={len(actions)}  Buy%={100*np.mean(actions):.1f}%  "
+          f"Total reward={sum(rewards):.4f}")
     return np.array(actions, dtype=np.float32), np.array(rewards, dtype=np.float32)
 
 
@@ -185,30 +193,17 @@ def build_shap_features(actions, rewards):
 
 
 # ── SHAP ──────────────────────────────────────────────────────────────────────
-def explain_with_shap(X, y):
-    """
-    Paper: "SHAP calculates the contribution of each of those 30 days
-            to the current reward prediction"
-
-    Fits a reward predictor on (60-dim past window → reward at t),
-    then runs SHAP KernelExplainer on it.
-    """
-    # Reward predictor: linear least-squares (interpretable baseline)
-    X_b   = np.hstack([X, np.ones((len(X), 1))])
-    coefs, _, _, _ = np.linalg.lstsq(X_b, y, rcond=None)
-
+def explain_with_shap(agent, X, y):
+    # Use the actual DQN to predict reward proxy (max Q-value)
     def predict_reward(x):
-        xb = np.hstack([np.atleast_2d(x), np.ones((len(np.atleast_2d(x)), 1))])
-        return xb @ coefs
+        q = agent.model.predict(np.atleast_2d(x))
+        return q.max(axis=1)   # max Q-value as reward proxy
 
     bg_idx     = np.random.choice(len(X), min(SHAP_BG, len(X)), replace=False)
     background = X[bg_idx]
-    test_X     = X[:100]
-
-    print(f"  Running SHAP (bg={len(background)}, explaining={len(test_X)} steps)...")
     explainer  = shap.KernelExplainer(predict_reward, background)
-    shap_vals  = explainer.shap_values(test_X, nsamples=100, silent=True)
-    return shap_vals, test_X, y[:100]
+    shap_vals  = explainer.shap_values(X[:100], nsamples=100, silent=True)
+    return shap_vals, X[:100], y[:100]
 
 
 # ── Aggregate to per-day SHAP ─────────────────────────────────────────────────
@@ -258,7 +253,7 @@ def run_pipeline(train_data, test_data, tickers_to_run=None):
         X, y = build_shap_features(actions, rewards)
         print(f"  SHAP feature matrix: {X.shape}")
 
-        shap_vals, test_X, test_y = explain_with_shap(X, y)
+        shap_vals, test_X, test_y = explain_with_shap(agent, X, y)
         d_shap, d_actions         = per_day_shap(shap_vals, actions)
         mean_d_shap               = np.abs(d_shap).mean(axis=0)
         dnames                    = day_names()
@@ -284,18 +279,47 @@ def run_pipeline(train_data, test_data, tickers_to_run=None):
 
     return results
 
+# diagnostic function 
+def diagnose_env(ticker, train_df, test_df):
+    print(f"\n--- Diagnosing {ticker} ---")
+    
+    # Check raw reward signal from env
+    env = StocksEnv(df=train_df, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(train_df)))
+    obs, _ = env.reset()
+    
+    rewards_buy  = []
+    rewards_sell = []
+    
+    # Step 20 times with buy, 20 with sell
+    for i in range(20):
+        _, r, done, trunc, info = env.step(1)  # buy
+        rewards_buy.append(r)
+        if done or trunc: break
+    
+    env.reset()
+    for i in range(20):
+        _, r, done, trunc, info = env.step(0)  # sell
+        rewards_sell.append(r)
+        if done or trunc: break
 
+    print(f"  Sample BUY  rewards: {[round(x,4) for x in rewards_buy[:5]]}")
+    print(f"  Sample SELL rewards: {[round(x,4) for x in rewards_sell[:5]]}")
+    print(f"  Train df shape: {train_df.shape}")
+    print(f"  Test  df shape: {test_df.shape}")
+    print(f"  Train df columns: {train_df.columns.tolist()}")
+    print(f"  Train df sample:\n{train_df.head(3)}")
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import importlib.util, os
     spec = importlib.util.spec_from_file_location(
-        "data_cleaning",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_cleaning.py")
+        "data_splitting",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_splitting.py")
     )
-    dc = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(dc)
-    train_data, test_data = dc.train_data, dc.test_data
-
+    ds = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ds)
+    train_data, test_data = ds.train_data, ds.test_data
+    diagnose_env("RELIANCE.BO", train_data["RELIANCE.BO"], test_data["RELIANCE.BO"])
+    diagnose_env("AAPL",        train_data["AAPL"],        test_data["AAPL"])
     DEMO      = ["RELIANCE.BO", "TCS.BO", "AAPL", "MSFT"]
     available = [t for t in DEMO if t in train_data and t in test_data]
     print(f"Running on: {available}")
