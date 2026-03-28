@@ -6,7 +6,7 @@ Paper: https://arxiv.org/abs/2208.08790
 Faithful implementation:
 1. Environment   : gym-anytrading StocksEnv, window=30, actions Buy(1)/Sell(0)
 2. DQN           : 2-hidden-layer MLP, experience replay, target network
-3. SHAP features : past 30 days' [action, reward] pairs -> 60-dim vector
+3. SHAP features : past 30 days' [action, reward] pairs → 60-dim vector
 4. SHAP target   : reward prediction (not Q-value)
 5. Output        : per-day SHAP contributions
 """
@@ -35,60 +35,45 @@ BATCH_SIZE    = 32
 MEMORY_SIZE   = 2000
 EPISODES      = 30
 SHAP_BG       = 50
-
-
-# ── Normalise OHLC dataframe ──────────────────────────────────────────────────
-def normalise_df(df):
-    """
-    Divide all OHLC columns by the first Close value so prices are
-    in the range ~1x. This keeps gym-anytrading rewards small and
-    stable, preventing gradient explosion in the MLP.
-    The paper uses Yahoo Finance data directly; normalisation is the
-    standard pre-processing step to make the env learnable.
-    """
-    scale = df["Close"].iloc[0]
-    return (df / scale).astype(np.float32)
-
+EPOCHS_PER_EPISODE = 100
 
 # ── Numpy MLP ─────────────────────────────────────────────────────────────────
 class MLP:
     def __init__(self, in_dim, h1, h2, out_dim):
-        self.W1 = np.random.randn(in_dim, h1) * np.sqrt(2 / in_dim)
+        self.W1 = np.random.randn(in_dim, h1) * np.sqrt(2/in_dim)
         self.b1 = np.zeros(h1)
-        self.W2 = np.random.randn(h1, h2) * np.sqrt(2 / h1)
+        self.W2 = np.random.randn(h1, h2) * np.sqrt(2/h1)
         self.b2 = np.zeros(h2)
-        self.W3 = np.random.randn(h2, out_dim) * np.sqrt(2 / h2)
+        self.W3 = np.random.randn(h2, out_dim) * np.sqrt(2/h2)
         self.b3 = np.zeros(out_dim)
 
-    def relu(self, x):
-        return np.maximum(0, x)
+    def relu(self, x): return np.maximum(0, x)
 
     def forward(self, x):
         x = np.atleast_2d(x)
-        self.z1 = x @ self.W1 + self.b1;    self.a1 = self.relu(self.z1)
+        self.z1 = x @ self.W1 + self.b1;   self.a1 = self.relu(self.z1)
         self.z2 = self.a1 @ self.W2 + self.b2; self.a2 = self.relu(self.z2)
         self.z3 = self.a2 @ self.W3 + self.b3
         return self.z3
 
-    def predict(self, x):
-        return self.forward(x)
+    def predict(self, x): return self.forward(x)
 
     def copy_from(self, other):
-        for attr in ['W1', 'b1', 'W2', 'b2', 'W3', 'b3']:
-            setattr(self, attr, getattr(other, attr).copy())
+        for a in ['W1','b1','W2','b2','W3','b3']:
+            setattr(self, a, getattr(other, a).copy())
 
     def update(self, x, tgt, lr):
         x = np.atleast_2d(x)
         q = self.forward(x)
         dL = (q - tgt) / x.shape[0]
-        dW3 = self.a2.T @ dL;      db3 = dL.sum(0)
-        da2 = dL @ self.W3.T;      dz2 = da2 * (self.z2 > 0)
-        dW2 = self.a1.T @ dz2;     db2 = dz2.sum(0)
-        da1 = dz2 @ self.W2.T;     dz1 = da1 * (self.z1 > 0)
-        dW1 = x.T @ dz1;           db1 = dz1.sum(0)
-        self.W3 -= lr * dW3;  self.b3 -= lr * db3
-        self.W2 -= lr * dW2;  self.b2 -= lr * db2
-        self.W1 -= lr * dW1;  self.b1 -= lr * db1
+        dW3=self.a2.T@dL; db3=dL.sum(0)
+        da2=dL@self.W3.T; dz2=da2*(self.z2>0)
+        dW2=self.a1.T@dz2; db2=dz2.sum(0)
+        da1=dz2@self.W2.T; dz1=da1*(self.z1>0)
+        dW1=x.T@dz1; db1=dz1.sum(0)
+        self.W3-=lr*dW3; self.b3-=lr*db3
+        self.W2-=lr*dW2; self.b2-=lr*db2
+        self.W1-=lr*dW1; self.b1-=lr*db1
 
 
 # ── DQN Agent ─────────────────────────────────────────────────────────────────
@@ -112,7 +97,7 @@ class DQNAgent:
     def replay(self):
         if len(self.memory) < BATCH_SIZE:
             return
-        batch = random.sample(self.memory, BATCH_SIZE)
+        batch  = random.sample(self.memory, BATCH_SIZE)
         S  = np.array([b[0] for b in batch])
         A  = np.array([b[1] for b in batch])
         R  = np.array([b[2] for b in batch])
@@ -133,23 +118,16 @@ class DQNAgent:
 
 # ── gym-anytrading env ────────────────────────────────────────────────────────
 def make_env(df):
-    """
-    Normalise df then wrap in StocksEnv.
-    Normalisation ensures reward signal is in range ~[-0.1, 0.1]
-    so the MLP can learn. Without it all rewards are 0 or huge.
-    """
-    norm = normalise_df(df)
-    env  = StocksEnv(df=norm, window_size=WINDOW_SIZE,
-                     frame_bound=(WINDOW_SIZE, len(norm)))
+    env = StocksEnv(df=df, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(df)))
     obs, _ = env.reset()
-    return env, obs.flatten().shape[0]
-
+    print(f"  Observation shape: {obs.shape}  →  flat dim: {obs.flatten().shape[0]}")
+    return env, obs.flatten().shape[0] 
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 def train_agent(ticker, train_df):
     env, state_dim = make_env(train_df)
-    agent   = DQNAgent(state_dim=state_dim)
-    ep_rews = []
+    agent    = DQNAgent(state_dim=state_dim)
+    ep_rews  = []
 
     for ep in range(1, EPISODES + 1):
         obs, _  = env.reset()
@@ -157,9 +135,9 @@ def train_agent(ticker, train_df):
         total   = 0.0
         done = trunc = False
         while not (done or trunc):
-            action              = agent.act(state)
+            action           = agent.act(state)
             obs2, r, done, trunc, _ = env.step(action)
-            next_state          = obs2.flatten()
+            next_state       = obs2.flatten()
             agent.remember(state, action, r, next_state, done or trunc)
             agent.replay()
             state = next_state
@@ -173,25 +151,24 @@ def train_agent(ticker, train_df):
 
 # ── Test: collect actions + rewards ──────────────────────────────────────────
 def collect_test_experience(test_df, agent):
-    """Run trained agent on test set with epsilon=0 (greedy)."""
-    agent.epsilon = 0.0
-    env, _  = make_env(test_df)
-    obs, _  = env.reset()
-    state   = obs.flatten()
+    agent.epsilon = 0
+    env, _ = make_env(test_df)
+    obs,_ = env.reset()
+    state = obs.flatten()
     actions, rewards = [], []
     done = trunc = False
-
     while not (done or trunc):
-        action              = agent.act(state)
+        action           = agent.act(state)
         obs2, r, done, trunc, _ = env.step(action)
         actions.append(action)
         rewards.append(float(r))
         state = obs2.flatten()
 
+    agent.epsilon = EPSILON_START
+
     print(f"  Steps={len(actions)}  Buy%={100*np.mean(actions):.1f}%  "
           f"Total reward={sum(rewards):.4f}")
-    return np.array(actions, dtype=np.float32), \
-           np.array(rewards, dtype=np.float32)
+    return np.array(actions, dtype=np.float32), np.array(rewards, dtype=np.float32)
 
 
 # ── Build SHAP feature matrix ─────────────────────────────────────────────────
@@ -202,59 +179,49 @@ def build_shap_features(actions, rewards):
 
     For each step t >= 30:
       X[t] = [action_{t-30}, reward_{t-30}, ..., action_{t-1}, reward_{t-1}]
-             shape (60,)  — interleaved action, reward per day
+             shape (60,)  —  interleaved action, reward per day
       y[t] = reward at step t  (what SHAP explains)
     """
     X, y = [], []
     for t in range(WINDOW_SIZE, len(actions)):
         row = np.empty(WINDOW_SIZE * 2, dtype=np.float32)
-        row[0::2] = actions[t - WINDOW_SIZE: t]
-        row[1::2] = rewards[t - WINDOW_SIZE: t]
+        row[0::2] = actions[t - WINDOW_SIZE: t]   # actions for each day
+        row[1::2] = rewards[t - WINDOW_SIZE: t]   # rewards for each day
         X.append(row)
         y.append(rewards[t])
     return np.array(X), np.array(y)
 
 
 # ── SHAP ──────────────────────────────────────────────────────────────────────
-def explain_with_shap(X, y):
-    """
-    Paper: "SHAP calculates the contribution of each of those 30 days
-            to the current reward prediction"
-
-    Fits a linear reward predictor on the 60-dim window -> reward,
-    then runs KernelExplainer on it.
-    """
-    X_b  = np.hstack([X, np.ones((len(X), 1))])
-    coefs, _, _, _ = np.linalg.lstsq(X_b, y, rcond=None)
-
+def explain_with_shap(agent, X, y):
+    # Use the actual DQN to predict reward proxy (max Q-value)
     def predict_reward(x):
-        xb = np.hstack([np.atleast_2d(x),
-                         np.ones((len(np.atleast_2d(x)), 1))])
-        return xb @ coefs
+        q = agent.model.predict(np.atleast_2d(x))
+        return q.max(axis=1)   # max Q-value as reward proxy
 
     bg_idx     = np.random.choice(len(X), min(SHAP_BG, len(X)), replace=False)
     background = X[bg_idx]
-    test_X     = X[:100]
-
-    print(f"  Running SHAP (bg={len(background)}, explaining={len(test_X)} steps)...")
-    explainer = shap.KernelExplainer(predict_reward, background)
-    shap_vals = explainer.shap_values(test_X, nsamples=100, silent=True)
-    return shap_vals, test_X, y[:100]
+    explainer  = shap.KernelExplainer(predict_reward, background)
+    shap_vals  = explainer.shap_values(X[:100], nsamples=100, silent=True)
+    return shap_vals, X[:100], y[:100]
 
 
-# ── Aggregate 60-dim SHAP to 30 per-day values ───────────────────────────────
+# ── Aggregate to per-day SHAP ─────────────────────────────────────────────────
 def per_day_shap(shap_vals, actions, start_idx=WINDOW_SIZE):
     """
-    Sum action-SHAP and reward-SHAP for each day into one value.
-    Also record which action was taken that day (for waterfall colour).
+    Sum the action-feature SHAP and reward-feature SHAP for each day
+    into a single per-day SHAP value.
+    Also return the action taken on that day (for waterfall colouring).
     """
-    n = shap_vals.shape[0]
-    day_shap    = np.zeros((n, WINDOW_SIZE))
-    day_actions = np.zeros((n, WINDOW_SIZE))
-    for t in range(n):
+    n_steps = shap_vals.shape[0]
+    day_shap    = np.zeros((n_steps, WINDOW_SIZE))
+    day_actions = np.zeros((n_steps, WINDOW_SIZE))
+
+    for t in range(n_steps):
         for d in range(WINDOW_SIZE):
             day_shap[t, d]    = shap_vals[t, d*2] + shap_vals[t, d*2 + 1]
             day_actions[t, d] = actions[start_idx + t - WINDOW_SIZE + d]
+
     return day_shap, day_actions
 
 
@@ -280,11 +247,13 @@ def run_pipeline(train_data, test_data, tickers_to_run=None):
 
         print("Collecting test experience...")
         actions, rewards = collect_test_experience(test_data[ticker], agent)
+        print(f"  Steps={len(actions)}  Buy%={100*actions.mean():.1f}%  "
+              f"Total reward={rewards.sum():.4f}")
 
         X, y = build_shap_features(actions, rewards)
         print(f"  SHAP feature matrix: {X.shape}")
 
-        shap_vals, test_X, test_y = explain_with_shap(X, y)
+        shap_vals, test_X, test_y = explain_with_shap(agent, X, y)
         d_shap, d_actions         = per_day_shap(shap_vals, actions)
         mean_d_shap               = np.abs(d_shap).mean(axis=0)
         dnames                    = day_names()
@@ -310,7 +279,35 @@ def run_pipeline(train_data, test_data, tickers_to_run=None):
 
     return results
 
+# diagnostic function 
+def diagnose_env(ticker, train_df, test_df):
+    print(f"\n--- Diagnosing {ticker} ---")
+    
+    # Check raw reward signal from env
+    env = StocksEnv(df=train_df, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(train_df)))
+    obs, _ = env.reset()
+    
+    rewards_buy  = []
+    rewards_sell = []
+    
+    # Step 20 times with buy, 20 with sell
+    for i in range(20):
+        _, r, done, trunc, info = env.step(1)  # buy
+        rewards_buy.append(r)
+        if done or trunc: break
+    
+    env.reset()
+    for i in range(20):
+        _, r, done, trunc, info = env.step(0)  # sell
+        rewards_sell.append(r)
+        if done or trunc: break
 
+    print(f"  Sample BUY  rewards: {[round(x,4) for x in rewards_buy[:5]]}")
+    print(f"  Sample SELL rewards: {[round(x,4) for x in rewards_sell[:5]]}")
+    print(f"  Train df shape: {train_df.shape}")
+    print(f"  Test  df shape: {test_df.shape}")
+    print(f"  Train df columns: {train_df.columns.tolist()}")
+    print(f"  Train df sample:\n{train_df.head(3)}")
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import importlib.util, os
@@ -321,7 +318,8 @@ if __name__ == "__main__":
     ds = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ds)
     train_data, test_data = ds.train_data, ds.test_data
-
+    diagnose_env("RELIANCE.BO", train_data["RELIANCE.BO"], test_data["RELIANCE.BO"])
+    diagnose_env("AAPL",        train_data["AAPL"],        test_data["AAPL"])
     DEMO      = ["RELIANCE.BO", "TCS.BO", "AAPL", "MSFT"]
     available = [t for t in DEMO if t in train_data and t in test_data]
     print(f"Running on: {available}")
