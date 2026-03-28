@@ -1,0 +1,20 @@
+# Core ML
+tensorflow==2.18.0        # latest stable; first TF to officially support NumPy 2.x
+numpy==1.26.4             # safest choice: compatible with TF 2.18, shap 0.47, pandas 2.x
+                          # (TF 2.18 supports both numpy 1.26 and 2.x, but shap 0.47
+                          #  works more reliably on 1.26 for DeepExplainer)
+
+# Explainability
+shap==0.47.0              # latest release; adds numpy 2 + keras 3 + TF 2.16+ support
+
+# Trading environment
+gymnasium==0.29.1         # minimum required by gym-anytrading 2.0.0
+gym-anytrading==2.0.0     # latest; uses gymnasium (not the old gym package)
+
+# Data
+yfinance==0.2.55          # last stable pre-v1.0 release; well-tested API
+pandas==2.2.3             # compatible with numpy 1.26; pandas 3.x requires numpy 2.x
+matplotlib==3.9.4         # stable; compatible with all above
+
+# Note: pandas==3.0.1 requires numpy>=2.0 — avoid this with numpy 1.26
+# Note: matplotlib==3.10.x may require newer numpy — 3.9.x is the safe band
