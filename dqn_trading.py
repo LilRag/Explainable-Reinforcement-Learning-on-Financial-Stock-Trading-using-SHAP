@@ -297,6 +297,7 @@ def diagnose_env(ticker, train_df, test_df):
     print(f"  Test  df shape: {test_df.shape}")
     print(f"  Train df columns: {train_df.columns.tolist()}")
     print(f"  Train df sample:\n{train_df.head(3)}")
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import importlib.util, os
@@ -309,8 +310,8 @@ if __name__ == "__main__":
     train_data, test_data = ds.train_data, ds.test_data
     diagnose_env("RELIANCE.BO", train_data["RELIANCE.BO"], test_data["RELIANCE.BO"])
     diagnose_env("AAPL",        train_data["AAPL"],        test_data["AAPL"])
-    DEMO      = ["RELIANCE.BO", "TCS.BO", "AAPL", "MSFT"]
-    available = [t for t in DEMO if t in train_data and t in test_data]
+    
+    available = list(train_data.keys())
     print(f"Running on: {available}")
     results   = run_pipeline(train_data, test_data, tickers_to_run=available)
 
@@ -320,3 +321,21 @@ if __name__ == "__main__":
     for ticker, r in results.items():
         top = r["day_names"][np.argmax(r["mean_day_shap"])]
         print(f"{ticker:<20} {r['rewards'].sum():>12.4f} {top:>15}")
+
+    summary = []
+    for ticker, r in results.items():
+        summary.append({
+            "ticker":       ticker,
+            "index":        "SENSEX" if ".BO" in ticker else "DJIA",
+            "total_reward": r["rewards"].sum(),
+            "buy_pct":      round(100 * r["actions"].mean(), 2),
+            "top_day":      r["day_names"][np.argmax(r["mean_day_shap"])],
+            "top_shap":     round(r["mean_day_shap"].max(), 6),
+        })
+    pd.DataFrame(summary).to_csv("results_summary.csv", index=False)
+
+    print("\nDQN vs Buy & Hold:")
+    for ticker, r in results.items():
+        closes = test_data[ticker]["Close"].values
+        bh     = closes[-1] - closes[0]
+        print(f"{ticker:20s} | DQN: {r['rewards'].sum():8.2f} | Buy&Hold: {bh:8.2f}")
