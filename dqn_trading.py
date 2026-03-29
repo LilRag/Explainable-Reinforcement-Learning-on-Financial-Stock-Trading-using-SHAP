@@ -1,16 +1,3 @@
-"""
-Explainable RL on Stock Trading using SHAP (DQN)
-=================================================
-Paper: https://arxiv.org/abs/2208.08790
-
-Faithful implementation:
-1. Environment   : gym-anytrading StocksEnv, window=30, actions Buy(1)/Sell(0)
-2. DQN           : 2-hidden-layer MLP, experience replay, target network
-3. SHAP features : past 30 days' [action, reward] pairs → 60-dim vector
-4. SHAP target   : reward prediction (not Q-value)
-5. Output        : per-day SHAP contributions
-"""
-
 import numpy as np
 import pandas as pd
 import random
@@ -36,6 +23,12 @@ MEMORY_SIZE   = 2000
 EPISODES      = 30
 SHAP_BG       = 50
 EPOCHS_PER_EPISODE = 100
+
+
+# ── Normalise OHLC dataframe ──────────────────────────────────────────────────
+def normalise_df(df):
+    scale = df['Close'].iloc[0]
+    return (df / scale).astype('float32')
 
 # ── Numpy MLP ─────────────────────────────────────────────────────────────────
 class MLP:
@@ -118,10 +111,10 @@ class DQNAgent:
 
 # ── gym-anytrading env ────────────────────────────────────────────────────────
 def make_env(df):
-    env = StocksEnv(df=df, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(df)))
+    norm = normalise_df(df)
+    env  = StocksEnv(df=norm, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(norm)))
     obs, _ = env.reset()
-    print(f"  Observation shape: {obs.shape}  →  flat dim: {obs.flatten().shape[0]}")
-    return env, obs.flatten().shape[0] 
+    return env, obs.flatten().shape[0]
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 def train_agent(ticker, train_df):
@@ -177,10 +170,6 @@ def build_shap_features(actions, rewards):
     Paper: "the sliding window of the past 30 days' actions and rewards
             is used as the feature vector"
 
-    For each step t >= 30:
-      X[t] = [action_{t-30}, reward_{t-30}, ..., action_{t-1}, reward_{t-1}]
-             shape (60,)  —  interleaved action, reward per day
-      y[t] = reward at step t  (what SHAP explains)
     """
     X, y = [], []
     for t in range(WINDOW_SIZE, len(actions)):

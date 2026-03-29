@@ -1,16 +1,3 @@
-"""
-SHAP Visualisation — Waterfall Plots
-=====================================
-Paper: https://arxiv.org/abs/2208.08790
-
-Output (matching paper):
-  - Waterfall plots showing which past days most influenced today's
-    predicted reward.
-  - Red bars  = days where action was Buy  (1)
-  - Blue bars = days where action was Sell (0)
-  - One waterfall per ticker, one bar per past day
-"""
-
 import os
 import numpy as np
 import matplotlib
@@ -160,7 +147,6 @@ for ticker, r in results.items():
     print(f"\n[{ticker}]")
     safe = ticker.replace(".", "_")
 
-    # Pick a test step where at least some past days were Buy — more interesting waterfall
     d_act  = r["day_actions"]   # (n_steps, 30)
     n_buys = d_act.sum(axis=1)  # how many buy days in each step's window
     best   = int(np.argmax(n_buys)) if n_buys.max() > 0 else 0
