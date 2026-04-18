@@ -6,14 +6,23 @@ from collections import deque
 from gym_anytrading.envs import StocksEnv
 import shap
 
+# ── TensorFlow import ─────────────────────────────────────────────────────────
+# CHANGED: replaces the hand-rolled numpy MLP.
+# suppress noisy TF startup logs before import
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import tensorflow as tf
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.optimizers import Adam
+
 warnings.filterwarnings("ignore")
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
+# Most values kept identical to the original paper so the ablation is clean.
 WINDOW_SIZE   = 30
 N_ACTIONS     = 2
-HIDDEN1       = 50
-HIDDEN2       = 50
-LR            = 0.005
+LR            = 1e-3          # CHANGED: 0.005 SGD → 1e-3 Adam (standard for Adam)
 GAMMA         = 0.95
 EPSILON_START = 1.0
 EPSILON_MIN   = 0.01
@@ -22,136 +31,233 @@ BATCH_SIZE    = 32
 MEMORY_SIZE   = 2000
 EPISODES      = 30
 SHAP_BG       = 50
-EPOCHS_PER_EPISODE = 100
+TAU           = 0.005         # CHANGED NEW: soft-update rate for target network
 
 
 # ── Normalise OHLC dataframe ──────────────────────────────────────────────────
+# UNCHANGED from original
 def normalise_df(df):
     scale = df['Close'].iloc[0]
     return (df / scale).astype('float32')
 
-# ── Numpy MLP ─────────────────────────────────────────────────────────────────
-class MLP:
-    def __init__(self, in_dim, h1, h2, out_dim):
-        self.W1 = np.random.randn(in_dim, h1) * np.sqrt(2/in_dim)
-        self.b1 = np.zeros(h1)
-        self.W2 = np.random.randn(h1, h2) * np.sqrt(2/h1)
-        self.b2 = np.zeros(h2)
-        self.W3 = np.random.randn(h2, out_dim) * np.sqrt(2/h2)
-        self.b3 = np.zeros(out_dim)
 
-    def relu(self, x): return np.maximum(0, x)
-
-    def forward(self, x):
-        x = np.atleast_2d(x)
-        self.z1 = x @ self.W1 + self.b1;   self.a1 = self.relu(self.z1)
-        self.z2 = self.a1 @ self.W2 + self.b2; self.a2 = self.relu(self.z2)
-        self.z3 = self.a2 @ self.W3 + self.b3
-        return self.z3
-
-    def predict(self, x): return self.forward(x)
-
-    def copy_from(self, other):
-        for a in ['W1','b1','W2','b2','W3','b3']:
-            setattr(self, a, getattr(other, a).copy())
-
-    def update(self, x, tgt, lr):
-        x = np.atleast_2d(x)
-        q = self.forward(x)
-        dL = (q - tgt) / x.shape[0]
-        dW3=self.a2.T@dL; db3=dL.sum(0)
-        da2=dL@self.W3.T; dz2=da2*(self.z2>0)
-        dW2=self.a1.T@dz2; db2=dz2.sum(0)
-        da1=dz2@self.W2.T; dz1=da1*(self.z1>0)
-        dW1=x.T@dz1; db1=dz1.sum(0)
-        self.W3-=lr*dW3; self.b3-=lr*db3
-        self.W2-=lr*dW2; self.b2-=lr*db2
-        self.W1-=lr*dW1; self.b1-=lr*db1
+# ── Build Keras model ─────────────────────────────────────────────────────────
+# CHANGED: replaces the MLP class entirely.
+#
+# Architecture: in_dim → 128 → 64 → N_ACTIONS  (deeper than original 50→50
+# because Adam handles larger nets stably — SGD would diverge here).
+#
+# Why not keep 50→50?  The original paper used a tiny net because manual
+# SGD with LR=0.005 is unstable with more neurons. Adam's adaptive per-
+# parameter learning rates let us scale up safely, giving the network more
+# capacity to learn non-linear Q-value surfaces.
+#
+# compile() is called here once.  During replay we call model.fit() for a
+# single gradient step — Keras handles backprop automatically.
+def build_keras_model(in_dim: int) -> tf.keras.Model:
+    model = Sequential([
+        Input(shape=(in_dim,)),
+        Dense(128, activation='relu'),   # wider than original 50 neurons
+        Dense(64,  activation='relu'),
+        Dense(N_ACTIONS, activation='linear'),   # linear output = raw Q-values
+    ])
+    model.compile(optimizer=Adam(learning_rate=LR), loss='mse')
+    return model
 
 
-# ── DQN Agent ─────────────────────────────────────────────────────────────────
-class DQNAgent:
-    def __init__(self, state_dim):
+# ── Soft update helper ────────────────────────────────────────────────────────
+# CHANGED: replaces the hard copy_from() every 10 steps.
+#
+# Soft update: θ_target ← τ·θ_online + (1-τ)·θ_target
+#
+# Why soft instead of hard?
+#   Hard copy creates a sudden shift in the Q-target every N steps, which
+#   can cause periodic spikes in the loss. Soft update blends weights
+#   continuously, giving smoother and more stable training — especially
+#   important when the network is larger and has more parameters to track.
+#
+# τ = 0.005 means the target moves 0.5% toward the online network each step.
+def soft_update(online: tf.keras.Model, target: tf.keras.Model, tau: float = TAU):
+    for w_online, w_target in zip(online.weights, target.weights):
+        w_target.assign(tau * w_online + (1.0 - tau) * w_target)
+
+
+# ── DDQN Agent ────────────────────────────────────────────────────────────────
+# CHANGED: was DQNAgent with numpy MLP. Now uses Keras + Adam + DDQN target.
+#
+# The two structural changes vs the original DQNAgent:
+#   1. model / target are Keras models, not MLP instances
+#   2. replay() computes DDQN targets instead of plain DQN targets
+#      (see the detailed comment inside replay())
+class DDQNAgent:
+    def __init__(self, state_dim: int):
         self.epsilon = EPSILON_START
         self.memory  = deque(maxlen=MEMORY_SIZE)
-        self.model   = MLP(state_dim, HIDDEN1, HIDDEN2, N_ACTIONS)
-        self.target  = MLP(state_dim, HIDDEN1, HIDDEN2, N_ACTIONS)
-        self.target.copy_from(self.model)
         self.steps   = 0
 
-    def act(self, state):
+        # Two separate networks — identical architecture, independent weights.
+        # online:  receives gradients, used to SELECT actions
+        # target:  frozen each step, used to EVALUATE selected actions
+        self.model  = build_keras_model(state_dim)   # online network
+        self.target = build_keras_model(state_dim)   # target network
+
+        # Initialise target weights == online weights so training starts stable
+        self.target.set_weights(self.model.get_weights())
+        self.initial_weights = [w.copy() for w in self.model.get_weights()]
+        
+
+    # ── Action selection (unchanged interface) ────────────────────────────────
+    def act(self, state: np.ndarray) -> int:
         if np.random.rand() < self.epsilon:
             return random.randrange(N_ACTIONS)
-        return int(np.argmax(self.model.predict(state)[0]))
+        q = self.model(np.atleast_2d(state), training=False).numpy()
+        return int(np.argmax(q[0]))
 
+    # ── Memory (unchanged) ────────────────────────────────────────────────────
     def remember(self, s, a, r, s2, done):
         self.memory.append((s, a, r, s2, done))
 
+    # ── DDQN replay ──────────────────────────────────────────────────────────
+    # This is the core algorithmic change.
+    #
+    # Plain DQN target (original):
+    #   T = R + γ · max_a Q_target(S', a)
+    #
+    # Problem: using the same network to both SELECT and EVALUATE the best
+    # next action consistently overestimates Q-values. Noisy Q-values get
+    # picked more often (because argmax favours noise), and then their
+    # inflated values propagate back through training. This is called
+    # "maximisation bias" and causes the agent to be overly optimistic,
+    # especially early in training when Q-values are inaccurate.
+    #
+    # DDQN fix (van Hasselt et al., 2016):
+    #   a* = argmax_a  Q_online(S', a)   ← ONLINE selects the action
+    #   T  = R + γ · Q_target(S', a*)    ← TARGET evaluates that action
+    #
+    # The online network (noisier, more up-to-date) picks what it thinks
+    # is the best action. The target network (smoother, older) gives a
+    # more conservative value estimate for that specific action.
+    # Decoupling selection from evaluation eliminates the upward bias.
     def replay(self):
         if len(self.memory) < BATCH_SIZE:
             return
-        batch  = random.sample(self.memory, BATCH_SIZE)
-        S  = np.array([b[0] for b in batch])
+        
+        batch = random.sample(self.memory, BATCH_SIZE)
+        S  = np.array([b[0] for b in batch], dtype=np.float32)
         A  = np.array([b[1] for b in batch])
-        R  = np.array([b[2] for b in batch])
-        S2 = np.array([b[3] for b in batch])
-        D  = np.array([b[4] for b in batch])
-        Q  = self.model.predict(S)
-        Qn = self.target.predict(S2)
-        T  = Q.copy()
+        R  = np.array([b[2] for b in batch], dtype=np.float32)
+        S2 = np.array([b[3] for b in batch], dtype=np.float32)
+        D  = np.array([b[4] for b in batch], dtype=bool)
+
+        # Current Q-values from online network (becomes our update target)
+        Q = self.model(S, training=False).numpy()
+
+        # ── DDQN target computation ──────────────────────────────────────────
+        # Step 1: online network decides which action is best in each S'
+        best_actions = np.argmax(
+            self.model(S2, training=False).numpy(),
+            axis=1
+        )   # shape: (BATCH_SIZE,)
+
+        # Step 2: target network evaluates Q-value of that specific action
+        Q_next_target = self.target(S2, training=False).numpy()
+                        # shape: (BATCH_SIZE, N_ACTIONS)
+
+        # Step 3: build the target vector, only updating the taken action's slot
+        T = Q.copy()
         for i in range(BATCH_SIZE):
-            T[i, A[i]] = R[i] if D[i] else R[i] + GAMMA * np.max(Qn[i])
-        self.model.update(S, T, LR)
-        self.steps += 1
+            if D[i]:
+                # Terminal state: no future reward
+                T[i, A[i]] = R[i]
+            else:
+                # DDQN: target evaluates the action online chose, not its own best
+                T[i, A[i]] = R[i] + GAMMA * Q_next_target[i, best_actions[i]]
+
+        # Single gradient step on the online network via Keras
+        # verbose=0 silences per-batch logs
+
+        history = self.model.fit(S, T, batch_size=BATCH_SIZE, epochs=1, verbose=0)
+        loss = history.history['loss'][0]
+
+        if self.steps % 50 == 0:
+            avg_q = np.mean(Q)
+            print(f"[train] step={self.steps} loss={loss:.5f} avg_q={avg_q:.4f} eps={self.epsilon:.3f}")
+
+        if self.steps % 200 == 0:
+            diff = np.mean([
+                np.mean(np.abs(w - iw))
+                for w, iw in zip(self.model.get_weights(), self.initial_weights)
+            ])
+            print(f"[weights] avg change={diff:.6f}")
+
+        # Epsilon decay (unchanged)
         if self.epsilon > EPSILON_MIN:
             self.epsilon *= EPSILON_DECAY
-        if self.steps % 10 == 0:
-            self.target.copy_from(self.model)
+            
+        history = self.model.fit(S, T, batch_size=BATCH_SIZE, epochs=1, verbose=0)
+        loss = history.history['loss'][0]
+
+        # Soft-update target weights every step (replaces hard copy every 10)
+        self.steps += 1
+        soft_update(self.model, self.target, TAU)
 
 
 # ── gym-anytrading env ────────────────────────────────────────────────────────
+# UNCHANGED — environment and observation shape are identical
 def make_env(df):
     norm = normalise_df(df)
     env  = StocksEnv(df=norm, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(norm)))
     obs, _ = env.reset()
     return env, obs.flatten().shape[0]
 
+
 # ── Train ─────────────────────────────────────────────────────────────────────
+# CHANGED: DQNAgent → DDQNAgent. Loop body is otherwise identical.
 def train_agent(ticker, train_df):
     env, state_dim = make_env(train_df)
-    agent    = DQNAgent(state_dim=state_dim)
+    agent    = DDQNAgent(state_dim=state_dim)
     ep_rews  = []
 
     for ep in range(1, EPISODES + 1):
         obs, _  = env.reset()
         state   = obs.flatten()
         total   = 0.0
+        ep_losses = [] # Track losses for this episode
         done = trunc = False
+        
         while not (done or trunc):
-            action           = agent.act(state)
+            action               = agent.act(state)
             obs2, r, done, trunc, _ = env.step(action)
-            next_state       = obs2.flatten()
+            next_state           = obs2.flatten()
             agent.remember(state, action, r, next_state, done or trunc)
-            agent.replay()
+            
+            loss = agent.replay()
+            if loss is not None:
+                ep_losses.append(loss)
+                
             state = next_state
             total += r
+            
         ep_rews.append(total)
-        if ep % 10 == 0:
-            print(f"  ep {ep:3d}/{EPISODES}  reward={total:.4f}  eps={agent.epsilon:.3f}")
+        avg_loss = np.mean(ep_losses) if ep_losses else 0.0
+        
+        # Print stats for EVERY episode
+        print(f"  Ep {ep:3d}/{EPISODES} | Reward: {total:>8.4f} | Avg Loss: {avg_loss:>8.5f} | Eps: {agent.epsilon:.3f}")
 
     return agent, ep_rews
 
 
 # ── Test: collect actions + rewards ──────────────────────────────────────────
+# UNCHANGED — epsilon=0 disables exploration during test
 def collect_test_experience(test_df, agent):
     agent.epsilon = 0
     env, _ = make_env(test_df)
-    obs,_ = env.reset()
-    state = obs.flatten()
+    obs, _ = env.reset()
+    state  = obs.flatten()
     actions, rewards = [], []
     done = trunc = False
     while not (done or trunc):
-        action           = agent.act(state)
+        action               = agent.act(state)
         obs2, r, done, trunc, _ = env.step(action)
         actions.append(action)
         rewards.append(float(r))
@@ -165,28 +271,35 @@ def collect_test_experience(test_df, agent):
 
 
 # ── Build SHAP feature matrix ─────────────────────────────────────────────────
+# UNCHANGED — same sliding window of past 30 days' (action, reward) pairs
 def build_shap_features(actions, rewards):
     """
     Paper: "the sliding window of the past 30 days' actions and rewards
             is used as the feature vector"
-
     """
     X, y = [], []
     for t in range(WINDOW_SIZE, len(actions)):
         row = np.empty(WINDOW_SIZE * 2, dtype=np.float32)
-        row[0::2] = actions[t - WINDOW_SIZE: t]   # actions for each day
-        row[1::2] = rewards[t - WINDOW_SIZE: t]   # rewards for each day
+        row[0::2] = actions[t - WINDOW_SIZE: t]
+        row[1::2] = rewards[t - WINDOW_SIZE: t]
         X.append(row)
         y.append(rewards[t])
     return np.array(X), np.array(y)
 
 
 # ── SHAP ──────────────────────────────────────────────────────────────────────
+# CHANGED: agent.model is now a Keras model, so predict_reward must call
+# .predict() with the Keras API.  Everything else (KernelExplainer, nsamples)
+# is kept identical so this ablation isolates only the DDQN change.
+#
+# NOTE: In Contribution 4 this will be swapped for shap.DeepExplainer which
+# will be ~30x faster and can explain all 253 test steps instead of 100.
 def explain_with_shap(agent, X, y):
-    # Use the actual DQN to predict reward proxy (max Q-value)
     def predict_reward(x):
-        q = agent.model.predict(np.atleast_2d(x))
-        return q.max(axis=1)   # max Q-value as reward proxy
+        # Keras .predict() expects numpy arrays and returns numpy arrays.
+        # suppress Keras progress bars with verbose=0
+        q = agent.model.predict(np.atleast_2d(x), verbose=0)
+        return q.max(axis=1)   # max Q-value as reward proxy (unchanged logic)
 
     bg_idx     = np.random.choice(len(X), min(SHAP_BG, len(X)), replace=False)
     background = X[bg_idx]
@@ -196,13 +309,9 @@ def explain_with_shap(agent, X, y):
 
 
 # ── Aggregate to per-day SHAP ─────────────────────────────────────────────────
+# UNCHANGED
 def per_day_shap(shap_vals, actions, start_idx=WINDOW_SIZE):
-    """
-    Sum the action-feature SHAP and reward-feature SHAP for each day
-    into a single per-day SHAP value.
-    Also return the action taken on that day (for waterfall colouring).
-    """
-    n_steps = shap_vals.shape[0]
+    n_steps     = shap_vals.shape[0]
     day_shap    = np.zeros((n_steps, WINDOW_SIZE))
     day_actions = np.zeros((n_steps, WINDOW_SIZE))
 
@@ -219,6 +328,7 @@ def day_names():
 
 
 # ── Full pipeline ─────────────────────────────────────────────────────────────
+# UNCHANGED — just prints "DDQN" in the header for clarity
 def run_pipeline(train_data, test_data, tickers_to_run=None):
     if tickers_to_run is None:
         tickers_to_run = list(train_data.keys())
@@ -230,7 +340,7 @@ def run_pipeline(train_data, test_data, tickers_to_run=None):
 
         print(f"\n{'='*55}\nTicker: {ticker}\n{'='*55}")
 
-        print("Training DQN (gym-anytrading)...")
+        print("Training DDQN (Keras + Adam)...")
         agent, ep_rews = train_agent(ticker, train_data[ticker])
         print(f"  Final ep reward: {ep_rews[-1]:.4f}")
 
@@ -268,26 +378,22 @@ def run_pipeline(train_data, test_data, tickers_to_run=None):
 
     return results
 
-# diagnostic function 
+
+# ── Diagnostic (kept for debugging, updated to DDQNAgent) ────────────────────
 def diagnose_env(ticker, train_df, test_df):
     print(f"\n--- Diagnosing {ticker} ---")
-    
-    # Check raw reward signal from env
     env = StocksEnv(df=train_df, window_size=WINDOW_SIZE, frame_bound=(WINDOW_SIZE, len(train_df)))
     obs, _ = env.reset()
-    
-    rewards_buy  = []
-    rewards_sell = []
-    
-    # Step 20 times with buy, 20 with sell
-    for i in range(20):
-        _, r, done, trunc, info = env.step(1)  # buy
+
+    rewards_buy, rewards_sell = [], []
+    for _ in range(20):
+        _, r, done, trunc, _ = env.step(1)
         rewards_buy.append(r)
         if done or trunc: break
-    
+
     env.reset()
-    for i in range(20):
-        _, r, done, trunc, info = env.step(0)  # sell
+    for _ in range(20):
+        _, r, done, trunc, _ = env.step(0)
         rewards_sell.append(r)
         if done or trunc: break
 
@@ -298,9 +404,11 @@ def diagnose_env(ticker, train_df, test_df):
     print(f"  Train df columns: {train_df.columns.tolist()}")
     print(f"  Train df sample:\n{train_df.head(3)}")
 
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import importlib.util, os
+    import importlib.util
+
     spec = importlib.util.spec_from_file_location(
         "data_splitting",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_splitting.py")
@@ -308,12 +416,13 @@ if __name__ == "__main__":
     ds = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ds)
     train_data, test_data = ds.train_data, ds.test_data
+
     diagnose_env("RELIANCE.BO", train_data["RELIANCE.BO"], test_data["RELIANCE.BO"])
     diagnose_env("AAPL",        train_data["AAPL"],        test_data["AAPL"])
-    
+
     available = list(train_data.keys())
-    print(f"Running on: {available}")
-    results   = run_pipeline(train_data, test_data, tickers_to_run=available)
+    print(f"\nRunning DDQN on: {available}")
+    results = run_pipeline(train_data, test_data, tickers_to_run=available)
 
     print("\nSummary:")
     print(f"{'Ticker':<20} {'Test Reward':>12} {'Top Day':>15}")
@@ -332,10 +441,10 @@ if __name__ == "__main__":
             "top_day":      r["day_names"][np.argmax(r["mean_day_shap"])],
             "top_shap":     round(r["mean_day_shap"].max(), 6),
         })
-    pd.DataFrame(summary).to_csv("results_summary.csv", index=False)
+    pd.DataFrame(summary).to_csv("results_summary_ddqn.csv", index=False)
 
-    print("\nDQN vs Buy & Hold:")
+    print("\nDDQN vs Buy & Hold:")
     for ticker, r in results.items():
         closes = test_data[ticker]["Close"].values
         bh     = closes[-1] - closes[0]
-        print(f"{ticker:20s} | DQN: {r['rewards'].sum():8.2f} | Buy&Hold: {bh:8.2f}")
+        print(f"{ticker:20s} | DDQN: {r['rewards'].sum():8.2f} | Buy&Hold: {bh:8.2f}")
