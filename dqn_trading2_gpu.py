@@ -46,11 +46,11 @@ EPSILON_MIN_TEST  = 0.0
 #   New: 0.80^10 ≈ 0.11  (reaches ~0.11 by ep 10, floors at 0.05 by ep ~13)
 # 0.80 per episode is more aggressive — the agent becomes greedy faster,
 # which is fine because we have fewer episodes to learn from anyway.
-EPSILON_DECAY     = 0.80   # was 0.90 for 30 eps
+EPSILON_DECAY     = 0.90   # was 0.90 for 30 eps
 
 BATCH_SIZE        = 16
 MEMORY_SIZE       = 1000
-EPISODES          = 10     # was 30
+EPISODES          = 30     # was 30
 
 # SHAP: reduced background + explain samples to match shorter test rollouts.
 # With fewer episodes the agent collects fewer unique test steps, so
