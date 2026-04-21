@@ -1,4 +1,5 @@
 import os
+import pickle
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -8,23 +9,18 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ── Re-run pipeline ────────────────────────────────────────────────────────────
-import importlib.util
-def load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod  = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
 base = os.path.dirname(os.path.abspath(__file__))
-ds   = load_module("data_splitting", os.path.join(base, "data_splitting.py"))
-dqn  = load_module("dqn_trading",   os.path.join(base, "dqn_trading.py"))
+results_path = os.path.join(base, "results.pkl")
+if not os.path.exists(results_path):
+    raise FileNotFoundError(
+        "results.pkl not found. Run dqn_trading2_gpu.py once to train and save results before plotting."
+    )
 
-train_data, test_data = ds.train_data, ds.test_data
+with open(results_path, "rb") as f:
+    results = pickle.load(f)
 
-TICKERS   = ["RELIANCE.BO", "TCS.BO", "AAPL", "MSFT"]
-available = [t for t in TICKERS if t in train_data and t in test_data]
-print(f"Running pipeline on: {available}")
-results = dqn.run_pipeline(train_data, test_data, tickers_to_run=available)
+print(f"Loaded saved results from: {results_path}")
+print(f"Plotting tickers: {list(results.keys())}")
 
 os.makedirs("plots", exist_ok=True)
 
